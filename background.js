@@ -73,29 +73,96 @@ async function runExport(tab) {
     if (value.error) throw new Error(value.error);
 
     const filename = buildFilename(value.title);
-    const blob = new Blob([value.markdown], { type: "text/markdown" });
-    const blobUrl = URL.createObjectURL(blob);
-
-    const downloadId = await browser.downloads.download({
-      url: blobUrl,
-      filename,
-      saveAs: true,
-    });
-
-    const cleanup = () => URL.revokeObjectURL(blobUrl);
-    const listener = (delta) => {
-      if (delta.id === downloadId && (delta.state?.current === "complete" || delta.state?.current === "interrupted")) {
-        browser.downloads.onChanged.removeListener(listener);
-        cleanup();
-      }
-    };
-    browser.downloads.onChanged.addListener(listener);
-    setTimeout(cleanup, 60000);
-
-    return { ok: true, filename };
+    return await saveMarkdown(tab, value.markdown, filename);
   } catch (err) {
     console.error("[AIchat2MD]", err);
     notify("Export failed", err.message || String(err));
+    return { error: err.message || String(err) };
+  }
+}
+
+// v2.0.1: the save step now has fallbacks. Firefox's downloads API can
+// reject with a bare "An unexpected error occurred" for reasons outside the
+// extension (a remembered save folder that no longer exists, a misbehaving
+// file-picker portal, a download-capturing add-on). The chat itself has
+// already been read and converted at this point, so instead of throwing it
+// away we try, in order:
+//   1. downloads.download with the "Save as" dialog (the normal path)
+//   2. downloads.download without the dialog (straight to Downloads)
+//   3. an ordinary <a download> click inside the chat tab — the same route
+//      the original claude-chat-exporter bookmarklet uses, which bypasses
+//      the downloads API entirely.
+// A user pressing Cancel in the dialog is not a failure and stops here.
+async function saveMarkdown(tab, markdown, filename) {
+  const errors = [];
+
+  for (const saveAs of [true, false]) {
+    const blobUrl = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+    try {
+      const downloadId = await browser.downloads.download({ url: blobUrl, filename, saveAs });
+      revokeWhenDone(downloadId, blobUrl);
+      if (errors.length) console.warn("[AIchat2MD] Saved after fallback. Earlier attempts:", errors);
+      return { ok: true, filename, method: saveAs ? "dialog" : "downloads-folder" };
+    } catch (err) {
+      URL.revokeObjectURL(blobUrl);
+      const msg = err?.message || String(err);
+      if (/cancel/i.test(msg)) return { error: "Export cancelled." };
+      errors.push(`downloads.download(saveAs: ${saveAs}): ${msg}`);
+      console.warn("[AIchat2MD] Download attempt failed:", errors[errors.length - 1], err);
+    }
+  }
+
+  try {
+    const [res] = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: pageDownload,
+      args: [markdown, filename],
+    });
+    if (res?.result?.ok) {
+      console.warn("[AIchat2MD] Saved via in-page download. Downloads API attempts failed:", errors);
+      return { ok: true, filename, method: "page" };
+    }
+    errors.push(`in-page download: ${res?.result?.error || "no result"}`);
+  } catch (err) {
+    errors.push(`in-page download: ${err?.message || String(err)}`);
+  }
+
+  throw new Error(`Couldn't save the file. ${errors.join(" | ")}`);
+}
+
+// Keep the blob alive until Firefox has finished reading it. The old fixed
+// 60-second revoke could fire while a "Save as" dialog was still open.
+function revokeWhenDone(downloadId, blobUrl) {
+  let done = false;
+  const cleanup = () => {
+    if (done) return;
+    done = true;
+    browser.downloads.onChanged.removeListener(listener);
+    URL.revokeObjectURL(blobUrl);
+  };
+  const listener = (delta) => {
+    if (delta.id !== downloadId) return;
+    const state = delta.state?.current;
+    if (state === "complete" || state === "interrupted") cleanup();
+  };
+  browser.downloads.onChanged.addListener(listener);
+  setTimeout(cleanup, 10 * 60 * 1000);
+}
+
+// Injected into the chat tab (self-contained, like the exporters below).
+function pageDownload(markdown, filename) {
+  try {
+    const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return { ok: true };
+  } catch (err) {
     return { error: err.message || String(err) };
   }
 }
