@@ -33,6 +33,7 @@ const PLATFORMS = [
 ];
 
 const DEFAULT_MODE = "toolbar"; // "toolbar" | "sidebar"
+const DEFAULT_DOWNLOAD_ATTACHMENTS = true; // keep in sync with options.js
 
 browser.action.onClicked.addListener(async (tab) => {
   const { uiMode = DEFAULT_MODE } = await browser.storage.local.get("uiMode");
@@ -63,9 +64,12 @@ async function runExport(tab) {
       return { error: "Not a supported conversation page." };
     }
 
+    const { downloadAttachments = DEFAULT_DOWNLOAD_ATTACHMENTS } = await browser.storage.local.get("downloadAttachments");
+
     const [injected] = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       func: platform.func,
+      args: [{ downloadAttachments }],
     });
 
     const value = injected && injected.result;
@@ -73,7 +77,28 @@ async function runExport(tab) {
     if (value.error) throw new Error(value.error);
 
     const filename = buildFilename(value.title);
-    return await saveMarkdown(tab, value.markdown, filename);
+    const mdResult = await saveFile(tab, { text: value.markdown, mime: "text/markdown" }, filename);
+    if (mdResult.error) return mdResult;
+
+    // Second download: the attachments ZIP, only when there's something in it.
+    // Unzipped next to the .md, its _attachments/ folder is what the links
+    // in the .md point at.
+    const files = value.files || [];
+    const failed = value.failed || [];
+    if (failed.length) {
+      console.warn("[AIchat2MD] Attachments left as claude.ai links:", failed);
+      notify("Some attachments weren't downloaded", `${failed.length} left as claude.ai links: ${failed.join(", ")}`.slice(0, 250));
+    }
+    if (!files.length) return mdResult;
+
+    const zipName = filename.replace(/\.md$/, " - attachments.zip");
+    const zipBytes = buildZip(files.map((f) => ({ path: `_attachments/${f.name}`, data: base64ToBytes(f.base64) })));
+    const zipResult = await saveFile(tab, { bytes: zipBytes, mime: "application/zip" }, zipName);
+    if (zipResult.error) {
+      notify("Attachments not saved", `${filename} was saved, but the attachments ZIP wasn't: ${zipResult.error}`);
+      return { ok: true, filename: `${filename} (attachments ZIP not saved)` };
+    }
+    return { ok: true, filename: `${filename} + ${zipName}` };
   } catch (err) {
     console.error("[AIchat2MD]", err);
     notify("Export failed", err.message || String(err));
@@ -93,11 +118,13 @@ async function runExport(tab) {
 //      the original claude-chat-exporter bookmarklet uses, which bypasses
 //      the downloads API entirely.
 // A user pressing Cancel in the dialog is not a failure and stops here.
-async function saveMarkdown(tab, markdown, filename) {
+// `content` is { text, mime } or { bytes: Uint8Array, mime }.
+async function saveFile(tab, content, filename) {
   const errors = [];
+  const makeBlob = () => new Blob([content.bytes || content.text], { type: content.mime });
 
   for (const saveAs of [true, false]) {
-    const blobUrl = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+    const blobUrl = URL.createObjectURL(makeBlob());
     try {
       const downloadId = await browser.downloads.download({ url: blobUrl, filename, saveAs });
       revokeWhenDone(downloadId, blobUrl);
@@ -116,7 +143,7 @@ async function saveMarkdown(tab, markdown, filename) {
     const [res] = await browser.scripting.executeScript({
       target: { tabId: tab.id },
       func: pageDownload,
-      args: [markdown, filename],
+      args: [content.bytes ? { base64: bytesToBase64(content.bytes) } : { text: content.text }, content.mime, filename],
     });
     if (res?.result?.ok) {
       console.warn("[AIchat2MD] Saved via in-page download. Downloads API attempts failed:", errors);
@@ -150,9 +177,15 @@ function revokeWhenDone(downloadId, blobUrl) {
 }
 
 // Injected into the chat tab (self-contained, like the exporters below).
-function pageDownload(markdown, filename) {
+function pageDownload(payload, mime, filename) {
   try {
-    const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown" }));
+    let data = payload.text;
+    if (payload.base64 != null) {
+      const bin = atob(payload.base64);
+      data = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
+    }
+    const url = URL.createObjectURL(new Blob([data], { type: mime }));
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
@@ -165,6 +198,97 @@ function pageDownload(markdown, filename) {
   } catch (err) {
     return { error: err.message || String(err) };
   }
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+// Minimal ZIP writer (store only, no compression — attachments are images
+// and PDFs, which are already compressed). UTF-8 filenames (flag bit 11).
+// Avoids pulling in a library for ~60 lines of format.
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function buildZip(entries) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2);
+  const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+
+  for (const { path, data } of entries) {
+    const name = enc.encode(path);
+    const crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true);
+    local.setUint16(8, 0, true);
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, name.length, true);
+    local.setUint16(28, 0, true);
+    locals.push(new Uint8Array(local.buffer), name, data);
+
+    const central = new DataView(new ArrayBuffer(46));
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(4, 20, true);
+    central.setUint16(6, 20, true);
+    central.setUint16(8, 0x0800, true);
+    central.setUint16(10, 0, true);
+    central.setUint16(12, dosTime, true);
+    central.setUint16(14, dosDate, true);
+    central.setUint32(16, crc, true);
+    central.setUint32(20, data.length, true);
+    central.setUint32(24, data.length, true);
+    central.setUint16(28, name.length, true);
+    central.setUint32(42, offset, true);
+    centrals.push(new Uint8Array(central.buffer), name);
+
+    offset += 30 + name.length + data.length;
+  }
+
+  const centralSize = centrals.reduce((n, p) => n + p.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, entries.length, true);
+  end.setUint16(10, entries.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+
+  const parts = [...locals, ...centrals, new Uint8Array(end.buffer)];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let pos = 0;
+  for (const p of parts) { out.set(p, pos); pos += p.length; }
+  return out;
 }
 
 // v2.0.0: dropped the trailing "(MM.DD.YY)" — agent already lives in the
@@ -204,7 +328,7 @@ function notify(title, message) {
 // conversation straight from claude.ai's own internal API (same endpoint the
 // app uses), which returns every message's source markdown in order, rather
 // than scraping the rendered DOM.
-async function exportClaude() {
+async function exportClaude(opts = {}) {
   try {
     const conversationId = window.location.pathname.split("/").pop();
     const orgId = document.cookie.match(/lastActiveOrg=([^;]+)/)?.[1];
@@ -291,6 +415,93 @@ async function exportClaude() {
 
     const yamlStr = (v) => '"' + String(v ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
+    // --- Attachments (v2.1.0) -------------------------------------------
+    // Format matches upstream claude-chat-exporter's describeAttachments():
+    // images embed, documents link, audio/blobs are named, and text
+    // extractions (.md/.docx/…) are inlined as a blockquote. New here: with
+    // opts.downloadAttachments on, images and documents are fetched with
+    // the signed-in session and returned as `files` for the background
+    // script to ZIP, and the .md links point at _attachments/<name> instead
+    // of claude.ai URLs (which only load while signed in). A file that
+    // fails to download keeps its claude.ai link.
+    const toAbsolute = (u) => {
+      if (!u || typeof u !== "string") return null;
+      try { return new URL(u, "https://claude.ai").href; } catch { return null; }
+    };
+    const meta = (...bits) => bits.filter(Boolean).join(" · ");
+    const formatBytes = (n) => {
+      if (n == null || isNaN(n)) return null;
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    };
+    const files = [];
+    const failed = [];
+    const usedNames = new Set();
+    const uniqueName = (raw) => {
+      const clean = String(raw || "file").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "file";
+      const dot = clean.lastIndexOf(".");
+      const stem = dot > 0 ? clean.slice(0, dot) : clean;
+      const ext = dot > 0 ? clean.slice(dot) : "";
+      let name = clean;
+      for (let i = 2; usedNames.has(name.toLowerCase()); i++) name = `${stem} (${i})${ext}`;
+      usedNames.add(name.toLowerCase());
+      return name;
+    };
+    const toBase64 = (bytes) => {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return btoa(bin);
+    };
+    const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
+    // Returns the link to use: local path if downloaded, else the remote URL.
+    const fetchLocal = async (url, name) => {
+      if (!url || !opts.downloadAttachments) return url;
+      try {
+        const r = await fetch(url, { credentials: "include" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        const finalName = uniqueName(name);
+        files.push({ name: finalName, base64: toBase64(bytes) });
+        return localLink(finalName);
+      } catch (e) {
+        failed.push(`${name} (${e.message || e})`);
+        return url;
+      }
+    };
+    const escAlt = (s) => String(s).replace(/[[\]]/g, "\\$&");
+    const describeAttachments = async (m) => {
+      const parts = [];
+      for (const f of m.files || []) {
+        const name = f.file_name || "file";
+        if (f.file_kind === "image") {
+          const url = toAbsolute(f.preview_url || f.preview_asset?.url);
+          const link = await fetchLocal(url, name);
+          parts.push(link ? `**Attachment: ${name} · image**\n\n![${escAlt(name)}](${link})` : `**Attachment: ${name} · image**`);
+        } else if (f.file_kind === "document") {
+          const url = toAbsolute(f.document_asset?.url);
+          // document_asset is Claude's PDF rendering of the upload.
+          const saveAs = /\.pdf$/i.test(name) ? name : `${name}.pdf`;
+          const link = await fetchLocal(url, saveAs);
+          const pages = f.document_asset?.page_count ?? f.page_count;
+          const info = meta("document", pages ? `${pages} page${pages === 1 ? "" : "s"}` : null);
+          parts.push(link ? `**Attachment: [${escAlt(name)}](${link}) · ${info}**` : `**Attachment: ${name} · ${info}**`);
+        } else {
+          parts.push(`**Attachment: ${meta(name, f.file_kind, formatBytes(f.size_bytes))}**`);
+        }
+      }
+      for (const a of m.attachments || []) {
+        const name = a.file_name || a.name || "attachment";
+        let block = `**Attachment: ${meta(name, a.file_type, formatBytes(a.file_size))}**`;
+        if (typeof a.extracted_content === "string" && a.extracted_content.trim()) {
+          block += "\n\n" + a.extracted_content.trim();
+        }
+        parts.push(block.split("\n").map((l) => (l.trim() ? `> ${l}` : ">")).join("\n"));
+      }
+      return parts.join("\n\n");
+    };
+    // ----------------------------------------------------------------------
+
     const title = data?.name?.trim() && data.name.trim() !== "New conversation" ? data.name.trim() : "Claude conversation";
     let markdown = [
       "---",
@@ -305,7 +516,7 @@ async function exportClaude() {
     let count = 0;
 
     for (const m of ordered) {
-      const parts = [];
+      const parts = [await describeAttachments(m)];
       for (const block of m.content || []) {
         if (block.type === "text" && typeof block.text === "string") parts.push(block.text.trim());
         else if (block.type === "tool_use") parts.push(renderToolUse(block));
@@ -319,7 +530,7 @@ async function exportClaude() {
     }
 
     if (!count) return { error: "No exportable content found in this conversation." };
-    return { title, markdown: body };
+    return { title, markdown: body, files, failed };
   } catch (err) {
     return { error: err.message || String(err) };
   }
