@@ -86,8 +86,8 @@ async function runExport(tab) {
     const files = value.files || [];
     const failed = value.failed || [];
     if (failed.length) {
-      console.warn("[AIchat2MD] Attachments left as claude.ai links:", failed);
-      notify("Some attachments weren't downloaded", `${failed.length} left as claude.ai links: ${failed.join(", ")}`.slice(0, 250));
+      console.warn("[AIchat2MD] Attachments not downloaded:", failed);
+      notify("Some attachments weren't downloaded", `${failed.length} left as links or labels in the .md: ${failed.join(", ")}`.slice(0, 250));
     }
     if (!files.length) return mdResult;
 
@@ -539,7 +539,19 @@ async function exportClaude(opts = {}) {
 // Reads the conversation from ChatGPT's internal backend API: fetches a
 // session access token, then the conversation's node graph, and walks the
 // current branch from `current_node` back to the root.
-async function exportChatGPT() {
+//
+// v2.2.0: attachments + cleanup. File handling follows the approach in
+// AI-Exporter by Gaurav Sisodia (MIT, github.com/sisodiabhumca/AI-Exporter):
+//   - images are `image_asset_pointer` parts whose pointer is
+//     `file-service://<id>` or `sediment://<id>`
+//   - uploaded documents are listed in `metadata.attachments` ({ id, name })
+//   - downloading is two steps: /backend-api/files/download/<id> returns
+//     JSON with a temporary `download_url`, which serves the actual bytes
+// Images ChatGPT generates arrive in hidden `tool` messages; they're shown
+// at the start of the next ChatGPT turn. Tool calls (code execution, web
+// search), hidden system messages and ChatGPT's interactive-layout markup
+// (<box>, <row>, {@body …}, citation markers) are left out of the export.
+async function exportChatGPT(opts = {}) {
   try {
     const conversationId = window.location.pathname.split("/").filter(Boolean).pop();
     if (!conversationId || conversationId.length < 20) {
@@ -551,19 +563,15 @@ async function exportChatGPT() {
     const session = await sessionRes.json();
     const token = session?.accessToken;
     if (!token) return { error: "Couldn't get a ChatGPT access token — are you signed in?" };
+    const authInit = { credentials: "include", headers: { Authorization: `Bearer ${token}` } };
 
-    const convoRes = await fetch(`/backend-api/conversation/${conversationId}`, {
-      credentials: "include",
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const convoRes = await fetch(`/backend-api/conversation/${conversationId}`, authInit);
     if (!convoRes.ok) return { error: `ChatGPT API request failed (HTTP ${convoRes.status}).` };
     const data = await convoRes.json();
 
     const mapping = data?.mapping;
     if (!mapping) return { error: "Unexpected ChatGPT API response — no conversation data." };
 
-    // Walk from the current leaf node back to the root via `parent`, reverse
-    // to get conversation order — same approach as the Claude exporter.
     let ordered = [];
     let nodeId = data.current_node;
     const seen = new Set();
@@ -574,45 +582,247 @@ async function exportChatGPT() {
     }
     ordered.reverse();
 
+    // --- Shared attachment helpers (copied per exporter: injected functions
+    // must be self-contained). Same output contract as exportClaude:
+    // `files` = [{ name, base64 }] for the background script to ZIP,
+    // `failed` = names left as links/labels. Off by default unless
+    // opts.downloadAttachments is set.
+    const files = [];
+    const failed = [];
+    const usedNames = new Set();
+    const MIME_EXT = { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif", "application/pdf": ".pdf", "text/plain": ".txt", "text/csv": ".csv" };
+    const uniqueName = (raw) => {
+      const clean = String(raw || "file").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim().slice(0, 150) || "file";
+      const dot = clean.lastIndexOf(".");
+      const stem = dot > 0 ? clean.slice(0, dot) : clean;
+      const ext = dot > 0 ? clean.slice(dot) : "";
+      let name = clean;
+      for (let i = 2; usedNames.has(name.toLowerCase()); i++) name = `${stem} (${i})${ext}`;
+      usedNames.add(name.toLowerCase());
+      return name;
+    };
+    const toBase64 = (bytes) => {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return btoa(bin);
+    };
+    const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
+    const escAlt = (s) => String(s).replace(/[[\]]/g, "\\$&");
+    const formatBytes = (n) => {
+      if (n == null || isNaN(n)) return null;
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    };
+    const meta = (...bits) => bits.filter(Boolean).join(" · ");
+    // Fetch a file's bytes, refusing responses that are obviously not the
+    // file (a JSON or HTML error/redirect page saved as "photo.png").
+    const fetchBytes = async (url, init, name) => {
+      const r = await fetch(url, init);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      if (/json|html/.test(type) && !/\.(json|html?)$/i.test(name || "")) throw new Error(`got ${type} instead of the file`);
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      if (!bytes.length) throw new Error("empty file");
+      return { bytes, type };
+    };
+    // getBytes() -> { bytes, type }. Returns { link, name }: link is the
+    // local _attachments/ path when saved, else `remote` (may be null).
+    const fetchLocal = async (rawName, getBytes, remote) => {
+      if (!opts.downloadAttachments) return { link: remote || null, name: rawName };
+      try {
+        const { bytes, type } = await getBytes();
+        let name = rawName;
+        if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
+        name = uniqueName(name);
+        files.push({ name, base64: toBase64(bytes) });
+        return { link: localLink(name), name };
+      } catch (e) {
+        failed.push(`${rawName} (${e.message || e})`);
+        return { link: remote || null, name: rawName };
+      }
+    };
+    const formatTs = (d) => (d && !isNaN(d.getTime())
+      ? d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
+      : null);
     const yamlStr = (v) => '"' + String(v ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+    // ----------------------------------------------------------------------
+
+    // Names/sizes for every uploaded file, so an image part can use its
+    // real filename instead of an ID.
+    const fileInfo = new Map();
+    for (const node of ordered) {
+      for (const a of node.message?.metadata?.attachments || []) {
+        if (a?.id) fileInfo.set(a.id, a);
+      }
+    }
+
+    const downloadFile = async (id, name) => {
+      let lastErr = "no download_url";
+      for (const path of [
+        `/backend-api/files/download/${encodeURIComponent(id)}?conversation_id=${encodeURIComponent(conversationId)}&inline=false`,
+        `/backend-api/files/download/${encodeURIComponent(id)}`,
+        `/backend-api/files/${encodeURIComponent(id)}/download`,
+      ]) {
+        let info;
+        try {
+          const r = await fetch(path, authInit);
+          if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
+          info = await r.json();
+        } catch (e) {
+          lastErr = e.message || String(e);
+          continue;
+        }
+        if (!info?.download_url) { lastErr = info?.error_code || info?.status || "no download_url"; continue; }
+        // Got a real link: its result (bytes or error) is the answer.
+        const url = new URL(info.download_url, location.origin);
+        const same = url.origin === location.origin;
+        return await fetchBytes(url.href, same ? authInit : { credentials: "omit" }, name);
+      }
+      throw new Error(lastErr);
+    };
+
+    const renderedIds = new Set();
+    const renderImage = async (part, generated) => {
+      const m = String(part?.asset_pointer || "").match(/^(?:file-service|sediment):\/\/(.+)$/);
+      if (!m) return "";
+      const id = m[1];
+      if (renderedIds.has(id)) return "";
+      renderedIds.add(id);
+      const known = fileInfo.get(id);
+      const short = id.replace(/^file[-_]/, "").slice(0, 8);
+      const baseName = known?.name || `${generated ? "generated-image" : "image"}-${short}`;
+      const { link, name } = await fetchLocal(baseName, () => downloadFile(id, baseName), null);
+      let out = `**Attachment: ${meta(name, generated ? "generated image" : "image")}**`;
+      if (link) out += `\n\n![${escAlt(name)}](${link})`;
+      const prompt = part.metadata?.dalle?.prompt;
+      if (generated && prompt) out += `\n\n*Prompt: ${prompt.trim()}*`;
+      return out;
+    };
+    const renderFile = async (a) => {
+      if (!a?.id || renderedIds.has(a.id)) return "";
+      renderedIds.add(a.id);
+      const baseName = a.name || `file-${a.id.slice(-8)}`;
+      const isImage = /^image\//.test(a.mime_type || "");
+      const { link, name } = await fetchLocal(baseName, () => downloadFile(a.id, baseName), null);
+      const info = meta(isImage ? "image" : a.mime_type, formatBytes(a.size));
+      if (!link) return `**Attachment: ${meta(name, info)}**`;
+      return isImage
+        ? `**Attachment: ${meta(name, info)}**\n\n![${escAlt(name)}](${link})`
+        : `**Attachment: [${escAlt(name)}](${link})${info ? ` · ${info}` : ""}**`;
+    };
+
+    // ChatGPT's citation markers (private-use characters wrapping
+    // "cite", "turn0search3" etc.) and its interactive-layout markup.
+    // Marker handling follows pionxzh/deepseek-exporter (MIT), which shares
+    // code with the same author's chatgpt-exporter.
+    const LAYOUT_TAG = /^(?:box|row|col|column|stack|grid|card|icon|divider|badge|list|list-item|title|text|checkbox|button|spacer|FileCite|Cite)$/;
+    const stripLayout = (input) => {
+      if (!/<(?:box|row|list|badge|title|checkbox|FileCite|Cite)\b|\{@body|\{#each/.test(input)) return input;
+      const out = [];
+      let inFence = false, depth = 0, skipEach = 0;
+      for (const line of input.split("\n")) {
+        const t = line.trim();
+        if (/^(```|~~~)/.test(t)) { inFence = !inFence; out.push(depth ? t : line); continue; }
+        if (inFence) { out.push(line); continue; }
+        if (/^\{@body\b/.test(t)) continue;
+        if (/^\{#each\b/.test(t)) { skipEach++; continue; }
+        if (/^\{\/each\}/.test(t)) { skipEach = Math.max(0, skipEach - 1); continue; }
+        if (skipEach) continue;
+        const wasInside = depth > 0;
+        let hadTag = false;
+        let s = line.replace(/<\/?([A-Za-z][\w-]*)\b(?:[^>"']|"[^"]*"|'[^']*')*?\/?>/g, (tag, name) => {
+          if (!LAYOUT_TAG.test(name)) return tag;
+          hadTag = true;
+          if (tag.startsWith("</")) { depth = Math.max(0, depth - 1); return ""; }
+          if (tag.endsWith("/>")) return "";
+          depth++;
+          return name === "list-item" ? "- " : "";
+        });
+        if (!hadTag && !wasInside) { out.push(line); continue; }
+        s = s.replace(/\{[^{}]*\}/g, "").trim();
+        if (s) out.push(s);
+        else if (out.length && out[out.length - 1] !== "") out.push("");
+      }
+      return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    };
+    const cleanText = (s) => stripLayout(
+      String(s)
+        .replace(/[ \t]?\uE200[^\uE201]*\uE201/g, "")
+        .replace(/[\uE203\uE204]/g, "")
+    ).trim();
+
     const title = (data?.title || "").trim() || "ChatGPT conversation";
-    let markdown = [
+    let body = [
       "---",
       `title: ${yamlStr(title)}`,
       `agent: "ChatGPT"`,
       `exported: ${new Date().toISOString().slice(0, 10)}`,
       `source: ${yamlStr(window.location.href)}`,
     ];
-    if (data?.model_slug) markdown.push(`model: ${yamlStr(data.model_slug)}`);
-    markdown.push("---", "");
-    let body = markdown.join("\n") + "\n";
+    if (data?.model_slug) body.push(`model: ${yamlStr(data.model_slug)}`);
+    body.push("---", "");
+    body = body.join("\n") + "\n";
     let count = 0;
+    let pendingImages = []; // generated images waiting for the next ChatGPT turn
+    let pendingTime = null;
+
+    const emit = (who, created, text) => {
+      const ts = formatTs(created);
+      body += `${ts ? `# ${who} — ${ts}` : `# ${who}`}\n\n${text}\n\n`;
+      count++;
+    };
 
     for (const node of ordered) {
       const msg = node.message;
       if (!msg) continue;
+      if (msg.metadata?.is_visually_hidden_from_conversation) continue;
       const role = msg.author?.role;
-      if (role !== "user" && role !== "assistant") continue; // skip system/tool nodes
       const contentType = msg.content?.content_type;
-      let text = "";
-      if (contentType === "text" && Array.isArray(msg.content.parts)) {
-        text = msg.content.parts.filter((p) => typeof p === "string").join("\n\n").trim();
-      } else if (contentType === "code" && typeof msg.content.text === "string") {
-        text = "```\n" + msg.content.text + "\n```";
-      }
-      if (!text) continue;
-
-      const who = role === "user" ? "Human" : "ChatGPT";
+      const parts = Array.isArray(msg.content?.parts) ? msg.content.parts : [];
       const created = msg.create_time ? new Date(msg.create_time * 1000) : null;
-      const ts = created && !isNaN(created.getTime())
-        ? created.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
-        : null;
-      body += `${ts ? `# ${who} — ${ts}` : `# ${who}`}\n\n${text}\n\n`;
-      count++;
+
+      if (role === "tool") {
+        for (const p of parts) {
+          if (p?.content_type === "image_asset_pointer") {
+            const img = await renderImage(p, true);
+            if (img) { pendingImages.push(img); pendingTime = pendingTime || created; }
+          }
+        }
+        continue;
+      }
+      if (role !== "user" && role !== "assistant") continue;
+      // Assistant messages addressed to a tool (python, web, …) are the
+      // behind-the-scenes steps, not the reply.
+      if (msg.recipient && msg.recipient !== "all") continue;
+      if (contentType !== "text" && contentType !== "multimodal_text") continue;
+
+      const out = [];
+      if (role === "user") {
+        for (const a of msg.metadata?.attachments || []) {
+          // Images also appear as parts below; render those there instead.
+          if (parts.some((p) => String(p?.asset_pointer || "").endsWith(a.id))) continue;
+          const f = await renderFile(a);
+          if (f) out.push(f);
+        }
+      } else if (pendingImages.length) {
+        out.push(...pendingImages);
+        pendingImages = [];
+        pendingTime = null;
+      }
+      for (const p of parts) {
+        if (typeof p === "string") { const t = cleanText(p); if (t) out.push(t); }
+        else if (p?.content_type === "image_asset_pointer") { const img = await renderImage(p, role === "assistant"); if (img) out.push(img); }
+        else if (typeof p?.text === "string") { const t = cleanText(p.text); if (t) out.push(t); }
+      }
+      const text = out.filter(Boolean).join("\n\n").trim();
+      if (!text) continue;
+      emit(role === "user" ? "Human" : "ChatGPT", created, text);
     }
+    if (pendingImages.length) emit("ChatGPT", pendingTime, pendingImages.join("\n\n"));
 
     if (!count) return { error: "No exportable content found in this conversation." };
-    return { title, markdown: body };
+    return { title, markdown: body, files, failed };
   } catch (err) {
     return { error: err.message || String(err) };
   }
@@ -750,35 +960,25 @@ async function exportGemini() {
   }
 }
 
-// NEW in v2.0.0 — UNVERIFIED against a live session, first draft only.
+// DeepSeek: internal API first, DOM scraping as a fallback.
 //
-// Tries two independently-uncertain approaches so a wrong guess on one
-// doesn't sink the whole export: first the internal API (unconfirmed
-// endpoint/shape), then falls back to DOM scraping if that fails
-// (unconfirmed selectors, but backed by real evidence this time — see
-// below). Whichever path actually works, check the console output either
-// way to see what happened on the other.
-// NEW in v2.0.0 — UNVERIFIED against a live session, first draft only.
+// v2.2.0 rewrite of the API path. Message structure, token parsing, branch
+// ordering and file URLs follow pionxzh/deepseek-exporter (MIT,
+// github.com/pionxzh/deepseek-exporter) and AI-Exporter (MIT). The v2.0.0
+// version looked for message text in `content`, but DeepSeek stores each
+// message as typed `fragments` — REQUEST (your text), RESPONSE (the answer),
+// THINK, SEARCH, FILE, … — so it always fell through to the DOM scraper,
+// which flattened formatting and mixed in search UI text.
 //
-// Tries two independently-uncertain approaches so a wrong guess on one
-// doesn't sink the whole export: first the internal API (unconfirmed
-// endpoint/shape), then falls back to DOM scraping if that fails
-// (unconfirmed selectors, but backed by real evidence — see below).
-// Whichever path actually works, check the console output either way to
-// see what happened on the other.
+// Attachments: listed in a message's `files` and in FILE fragments. Their
+// paths (`/file?…`) live on DeepSeek's separate file service, which serves
+// them without the login session. Images use the preview variant (`ty=p`)
+// like the web app does; whether that's full resolution is unverified.
 //
-// IMPORTANT: tryApi/tryDom are declared INSIDE this function on purpose.
-// scripting.executeScript only ships the one function passed to it into
-// the target page — separate top-level functions aren't visible from
-// inside the injected context, and calling one throws a ReferenceError
-// that never surfaces cleanly (an early version of this file had that
-// exact bug: DeepSeek's export failed instantly with no console output
-// at all, because the crash happened before any of this file's own
-// logging ever ran). Nested declarations avoid that; every exporter in
-// this file follows the same fully-self-contained rule for the same reason.
-async function exportDeepSeek() {
-  // Adapted from how similar open-source DeepSeek exporters describe the
-  // endpoint/auth — not confirmed against a real logged-in session.
+// IMPORTANT: tryApi/tryDom are declared INSIDE this function on purpose —
+// scripting.executeScript only ships the one function passed to it, so a
+// call to any other top-level function throws a ReferenceError in the page.
+async function exportDeepSeek(opts = {}) {
   async function tryApi() {
     try {
       const chatSessionId = window.location.pathname.split("/").filter(Boolean).pop();
@@ -786,46 +986,222 @@ async function exportDeepSeek() {
         return { error: "Couldn't read a conversation ID from the URL." };
       }
 
+      // localStorage "userToken" is usually JSON like {"value":"…"}, but
+      // older/other builds store the bare string.
+      const findToken = (v, d = 0) => {
+        if (d > 3) return null;
+        if (typeof v === "string") return v.trim() || null;
+        if (!v || typeof v !== "object") return null;
+        return findToken(v.value, d + 1) ?? findToken(v.token, d + 1) ?? findToken(v.access_token, d + 1) ?? findToken(v.accessToken, d + 1);
+      };
       let token = null;
       try {
         const raw = localStorage.getItem("userToken");
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          token = parsed?.value || parsed?.token || (typeof parsed === "string" ? parsed : null);
-        }
-      } catch (e) {
-        // fall through — token stays null, handled below
-      }
-      if (!token) return { error: "no auth token found in localStorage under 'userToken'." };
+        if (raw) { try { token = findToken(JSON.parse(raw)); } catch { token = raw.trim() || null; } }
+      } catch { /* token stays null */ }
+      if (!token) return { error: "no login token found in localStorage under 'userToken'." };
 
-      const apiUrl = `https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=${chatSessionId}`;
-      const res = await fetch(apiUrl, { credentials: "include", headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(`/api/v0/chat/history_messages?chat_session_id=${encodeURIComponent(chatSessionId)}`, {
+        credentials: "include",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+          "x-client-platform": "web",
+          "x-client-locale": (document.documentElement.lang || navigator.language || "en-US").replace("-", "_"),
+        },
+      });
       if (!res.ok) return { error: `API request failed (HTTP ${res.status}).` };
       const data = await res.json();
-      console.log("[AIchat2MD] DeepSeek raw API response:", data);
+      if (data?.code != null && String(data.code) !== "0") return { error: `API error ${data.code}: ${data.msg || "unknown"}` };
+      const biz = data?.data?.biz_data || data?.biz_data || {};
+      const all = biz.chat_messages || biz.messages || [];
+      if (!Array.isArray(all) || !all.length) {
+        console.log("[AIchat2MD] DeepSeek raw API response:", data);
+        return { error: "no messages in API response (logged to console)." };
+      }
 
-      const messages =
-        data?.data?.biz_data?.chat_messages || data?.data?.chat_messages ||
-        data?.biz_data?.chat_messages || data?.chat_messages || null;
-      if (!Array.isArray(messages)) return { error: "response wasn't in the expected shape (logged to console)." };
-      if (!messages.length) return { error: "no messages in API response." };
-
+      // --- Shared attachment helpers (copied per exporter: injected functions
+      // must be self-contained). Same output contract as exportClaude:
+      // `files` = [{ name, base64 }] for the background script to ZIP,
+      // `failed` = names left as links/labels. Off by default unless
+      // opts.downloadAttachments is set.
+      const files = [];
+      const failed = [];
+      const usedNames = new Set();
+      const MIME_EXT = { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif", "application/pdf": ".pdf", "text/plain": ".txt", "text/csv": ".csv" };
+      const uniqueName = (raw) => {
+        const clean = String(raw || "file").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim().slice(0, 150) || "file";
+        const dot = clean.lastIndexOf(".");
+        const stem = dot > 0 ? clean.slice(0, dot) : clean;
+        const ext = dot > 0 ? clean.slice(dot) : "";
+        let name = clean;
+        for (let i = 2; usedNames.has(name.toLowerCase()); i++) name = `${stem} (${i})${ext}`;
+        usedNames.add(name.toLowerCase());
+        return name;
+      };
+      const toBase64 = (bytes) => {
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        return btoa(bin);
+      };
+      const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
+      const escAlt = (s) => String(s).replace(/[[\]]/g, "\\$&");
+      const formatBytes = (n) => {
+        if (n == null || isNaN(n)) return null;
+        if (n < 1024) return `${n} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+      };
+      const meta = (...bits) => bits.filter(Boolean).join(" · ");
+      // Fetch a file's bytes, refusing responses that are obviously not the
+      // file (a JSON or HTML error/redirect page saved as "photo.png").
+      const fetchBytes = async (url, init, name) => {
+        const r = await fetch(url, init);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+        if (/json|html/.test(type) && !/\.(json|html?)$/i.test(name || "")) throw new Error(`got ${type} instead of the file`);
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        if (!bytes.length) throw new Error("empty file");
+        return { bytes, type };
+      };
+      // getBytes() -> { bytes, type }. Returns { link, name }: link is the
+      // local _attachments/ path when saved, else `remote` (may be null).
+      const fetchLocal = async (rawName, getBytes, remote) => {
+        if (!opts.downloadAttachments) return { link: remote || null, name: rawName };
+        try {
+          const { bytes, type } = await getBytes();
+          let name = rawName;
+          if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
+          name = uniqueName(name);
+          files.push({ name, base64: toBase64(bytes) });
+          return { link: localLink(name), name };
+        } catch (e) {
+          failed.push(`${rawName} (${e.message || e})`);
+          return { link: remote || null, name: rawName };
+        }
+      };
+      const formatTs = (d) => (d && !isNaN(d.getTime())
+        ? d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
+        : null);
       const yamlStr = (v) => '"' + String(v ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
-      const rawTitle = document.title.replace(/\s*[-|]\s*DeepSeek.*$/i, "").trim();
+      // ----------------------------------------------------------------------
+
+      // Follow the branch on screen: current_message_id back via parent_id.
+      const byId = new Map(all.map((m) => [String(m.message_id), m]));
+      const toDate = (v) => {
+        if (v == null) return null;
+        const n = typeof v === "number" ? v : Number(v);
+        if (Number.isFinite(n)) return new Date(n > 1e10 ? n : n * 1000);
+        const d = new Date(v);
+        return isNaN(d.getTime()) ? null : d;
+      };
+      let currentId = biz.chat_session?.current_message_id != null ? String(biz.chat_session.current_message_id) : "";
+      if (!byId.has(currentId)) {
+        const parents = new Set(all.map((m) => m.parent_id).filter((x) => x != null).map(String));
+        const leaves = all.filter((m) => !parents.has(String(m.message_id)));
+        const pick = (leaves.length ? leaves : all).slice().sort((a, b) => (toDate(a.inserted_at) || 0) - (toDate(b.inserted_at) || 0)).pop();
+        currentId = pick ? String(pick.message_id) : "";
+      }
+      const ordered = [];
+      const visited = new Set();
+      while (currentId && !visited.has(currentId) && byId.has(currentId)) {
+        visited.add(currentId);
+        const m = byId.get(currentId);
+        ordered.push(m);
+        currentId = m.parent_id != null ? String(m.parent_id) : "";
+      }
+      ordered.reverse();
+
+      const ftype = (f) => String(f?.type || "").toUpperCase();
+      const visibleText = (m) => {
+        const role = String(m.role || "").toUpperCase();
+        const accepted = role === "USER" ? ["REQUEST"] : ["RESPONSE", "TEMPLATE_RESPONSE"];
+        const frags = Array.isArray(m.fragments) ? m.fragments : [];
+        const str = (f) => (typeof f?.content === "string" ? f.content.trim() : "");
+        let parts = frags.filter((f) => accepted.includes(ftype(f))).map(str).filter(Boolean);
+        if (!parts.length && typeof m.content === "string") parts = [m.content.trim()];
+        if (!parts.length) {
+          const skip = ["THINK", "TOOL_SEARCH", "TOOL_OPEN", "SEARCH", "TIP", "FILE", "READ_LINK"];
+          parts = frags.filter((f) => !skip.includes(ftype(f))).map(str).filter(Boolean);
+        }
+        // Web-search citation markers like [citation:3] point at a search
+        // panel that isn't exported.
+        return parts.join("\n\n").replace(/\s?\[citation:\d+\]/g, "").trim();
+      };
+
+      const FILE_SERVICE = "https://files.deepseeksvc.com/api";
+      const fileUrl = (f) => {
+        const v = typeof f.signed_path === "string" ? f.signed_path : typeof f.url === "string" ? f.url : null;
+        if (!v) return null;
+        try {
+          if (/^\/file(?:\?|$)/.test(v)) return new URL(FILE_SERVICE + v);
+          return new URL(v, location.origin);
+        } catch { return null; }
+      };
+      const isImage = (f) => f.is_image === true || /^image\//.test(f.mime_type || f.mimetype || "") ||
+        /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(f.file_name || f.filename || f.name || "");
+      const collectFiles = (m) => {
+        const list = [...(Array.isArray(m.files) ? m.files : [])];
+        for (const fr of m.fragments || []) {
+          if (ftype(fr) !== "FILE") continue;
+          if (Array.isArray(fr.files)) list.push(...fr.files);
+          if (fr.file && typeof fr.file === "object") list.push(fr.file);
+        }
+        const seenF = new Set();
+        return list.filter((f) => {
+          const key = String(f.id ?? f.file_id ?? f.signed_path ?? f.url ?? f.file_name ?? Math.random());
+          if (seenF.has(key)) return false;
+          seenF.add(key);
+          return true;
+        });
+      };
+      const renderFiles = async (m) => {
+        const out = [];
+        for (const f of collectFiles(m)) {
+          const baseName = f.file_name || f.filename || f.name || "attachment";
+          const img = isImage(f);
+          const url = fileUrl(f);
+          if (url && img && url.hostname.includes("deepseeksvc") && !url.searchParams.has("ty")) url.searchParams.set("ty", "p");
+          const sameOrigin = url && url.origin === location.origin;
+          const init = sameOrigin
+            ? { credentials: "include", headers: { Authorization: `Bearer ${token}`, Accept: "*/*" } }
+            : { credentials: "omit" };
+          const { link, name } = url
+            ? await fetchLocal(baseName, () => fetchBytes(url.href, init, baseName), url.href)
+            : { link: null, name: baseName };
+          if (!url && opts.downloadAttachments) failed.push(`${baseName} (no file URL)`);
+          const size = formatBytes(f.size ?? f.file_size);
+          if (img) {
+            out.push(`**Attachment: ${meta(name, "image", size)}**` + (link ? `\n\n![${escAlt(name)}](${link})` : ""));
+          } else {
+            out.push(link ? `**Attachment: [${escAlt(name)}](${link})${size ? ` · ${size}` : ""}**` : `**Attachment: ${meta(name, size)}**`);
+          }
+        }
+        return out;
+      };
+
+      const rawTitle = (biz.chat_session?.title || "").trim() ||
+        document.title.replace(/\s*[-|]\s*DeepSeek.*$/i, "").trim();
       const title = rawTitle && rawTitle.toLowerCase() !== "deepseek" ? rawTitle : "DeepSeek conversation";
-      let body = ["---", `title: ${yamlStr(title)}`, `agent: "DeepSeek"`, `exported: ${new Date().toISOString().slice(0, 10)}`, `source: ${yamlStr(window.location.href)}`, "---", ""].join("\n") + "\n";
+      let body = ["---", `title: ${yamlStr(title)}`, `agent: "DeepSeek"`, `exported: ${new Date().toISOString().slice(0, 10)}`, `source: ${yamlStr(window.location.href)}`];
+      const model = ordered.find((m) => m.model)?.model;
+      if (model) body.push(`model: ${yamlStr(model)}`);
+      body.push("---", "");
+      body = body.join("\n") + "\n";
       let count = 0;
 
-      for (const m of messages) {
-        const role = m.role || m.author_role;
-        if (role !== "USER" && role !== "ASSISTANT" && role !== "user" && role !== "assistant") continue;
-        const text = (m.content || m.text || "").trim();
-        if (!text) continue;
-        body += `# ${/user/i.test(role) ? "Human" : "DeepSeek"}\n\n${text}\n\n`;
+      for (const m of ordered) {
+        const role = String(m.role || "").toUpperCase();
+        if (role !== "USER" && role !== "ASSISTANT") continue;
+        const parts = [...(await renderFiles(m)), visibleText(m)].filter(Boolean);
+        if (!parts.length) continue;
+        const who = role === "USER" ? "Human" : "DeepSeek";
+        const ts = formatTs(toDate(m.inserted_at));
+        body += `${ts ? `# ${who} — ${ts}` : `# ${who}`}\n\n${parts.join("\n\n")}\n\n`;
         count++;
       }
       if (!count) return { error: "parsed API response but found no usable message text." };
-      return { title, markdown: body };
+      return { title, markdown: body, files, failed };
     } catch (err) {
       return { error: err.message || String(err) };
     }
