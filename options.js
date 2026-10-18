@@ -20,3 +20,12 @@ for (const r of radios) {
     }
   });
 }
+
+// v2.1.0: attachments ZIP toggle. Default must match background.js.
+const DEFAULT_DOWNLOAD_ATTACHMENTS = true;
+const attachBox = document.getElementById("downloadAttachments");
+(async () => {
+  const { downloadAttachments = DEFAULT_DOWNLOAD_ATTACHMENTS } = await browser.storage.local.get("downloadAttachments");
+  attachBox.checked = downloadAttachments;
+})();
+attachBox.addEventListener("change", () => browser.storage.local.set({ downloadAttachments: attachBox.checked }));
