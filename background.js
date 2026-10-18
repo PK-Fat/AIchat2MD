@@ -458,6 +458,14 @@ async function exportClaude(opts = {}) {
       fr.onerror = () => reject(fr.error || new Error("couldn't read file"));
       fr.readAsDataURL(blob);
     });
+    const IMG_EXT = { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif" };
+    const fixImageExt = (name, type) => {
+      const want = IMG_EXT[String(type || "").split(";")[0].trim().toLowerCase()];
+      if (!want) return name;
+      if (want === ".jpg" && /\.jpe?g$/i.test(name)) return name;
+      if (name.toLowerCase().endsWith(want)) return name;
+      return name.replace(/\.(png|jpe?g|webp|gif|avif|bmp)$/i, "") + want;
+    };
     const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
     // Returns the link to use: local path if downloaded, else the remote URL.
     const fetchLocal = async (url, name) => {
@@ -468,7 +476,9 @@ async function exportClaude(opts = {}) {
         const blob = await r.blob();
         if (!blob.size) throw new Error("empty file");
         const base64 = await blobToBase64(blob);
-        const finalName = uniqueName(name);
+        // Claude serves a re-encoded preview (WebP) even for .png uploads;
+        // name the file by what it actually is.
+        const finalName = uniqueName(fixImageExt(name, blob.type));
         files.push({ name: finalName, base64 });
         return localLink(finalName);
       } catch (e) {
@@ -645,7 +655,11 @@ async function exportChatGPT(opts = {}) {
       try {
         const { blob, type } = await getBytes();
         let name = rawName;
-        if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
+        if (/^image\//.test(type) && MIME_EXT[type]) {
+          // Name images by what the server actually sent (e.g. a WebP preview).
+          const want = MIME_EXT[type];
+          if (!(want === ".jpg" && /\.jpe?g$/i.test(name)) && !name.toLowerCase().endsWith(want)) name = name.replace(/\.(png|jpe?g|webp|gif|avif|bmp)$/i, "") + want;
+        } else if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
         name = uniqueName(name);
         files.push({ name, base64: await blobToBase64(blob) });
         return { link: localLink(name), name };
@@ -1088,7 +1102,11 @@ async function exportDeepSeek(opts = {}) {
         try {
           const { blob, type } = await getBytes();
           let name = rawName;
-          if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
+          if (/^image\//.test(type) && MIME_EXT[type]) {
+            // Name images by what the server actually sent (e.g. a WebP preview).
+            const want = MIME_EXT[type];
+            if (!(want === ".jpg" && /\.jpe?g$/i.test(name)) && !name.toLowerCase().endsWith(want)) name = name.replace(/\.(png|jpe?g|webp|gif|avif|bmp)$/i, "") + want;
+          } else if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
           name = uniqueName(name);
           files.push({ name, base64: await blobToBase64(blob) });
           return { link: localLink(name), name };
