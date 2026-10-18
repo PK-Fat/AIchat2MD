@@ -137,7 +137,9 @@ Toolbar or sidebar — pick one in the extension's options page (`about:addons` 
 - 🟢 Relies on each service's internal, undocumented API (Claude, ChatGPT, DeepSeek) or rendered page structure (Gemini) — a response-shape or UI change would require an update
 - 🟢 **Claude**: other tool calls (web search, bash, file view/edit) and internal thinking blocks aren't exported by design
 - **Gemini**: images and attachments aren't exported yet
-- **ChatGPT / DeepSeek attachments**: built from other open-source exporters' documented approaches but not yet verified against a live session; DeepSeek images use the preview size the web app shows
+- **ChatGPT**: verified live (Oct 2026) for uploaded and generated images and for files its code tool creates (PDF, PNG, ZIP). Those created files expire some time after the chat, and some can't be downloaded at all — a generated `.js` file failed in ChatGPT's own preview and Download button too. Either way the `.md` gets a "file not saved" label instead of a dead link
+- **Claude**: uploaded images export as Claude's downscaled WebP preview; whether the original file can be downloaded is unconfirmed
+- **DeepSeek attachments**: built from other open-source exporters' documented approaches but not yet verified against a live session; images use the preview size the web app shows
 - **Gemini and DeepSeek's DOM-scraping paths** are inherently more fragile than Claude/ChatGPT's API-based ones — a Google or DeepSeek UI update is more likely to break these than a Claude/OpenAI one is to break theirs
 - All four only export the currently-selected branch of a conversation, not every regenerated alternative
 
