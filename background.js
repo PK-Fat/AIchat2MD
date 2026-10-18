@@ -827,7 +827,10 @@ async function exportChatGPT(opts = {}) {
           sandboxCache.set(path, await fetchLocal(base, () => downloadSandbox(path), null));
         }
         const { link, name } = sandboxCache.get(path);
-        text = text.replace(whole, link ? `[${label}](${link})` : `${label} *(file not saved: ${name})*`);
+        // "not saved" only when a download was attempted and failed; with the
+        // setting off, just name the file.
+        text = text.replace(whole, link ? `[${label}](${link})`
+          : opts.downloadAttachments ? `${label} *(file not saved: ${name})*` : `${label} *(file: ${name})*`);
       }
       return text;
     };
