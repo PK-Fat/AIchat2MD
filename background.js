@@ -716,7 +716,7 @@ async function exportChatGPT(opts = {}) {
       if (renderedIds.has(id)) return "";
       renderedIds.add(id);
       const known = fileInfo.get(id);
-      const short = id.replace(/^file[-_]/, "").slice(0, 8);
+      const short = id.replace(/^file[-_]/, "").slice(-8);
       const baseName = known?.name || `${generated ? "generated-image" : "image"}-${short}`;
       const { link, name } = await fetchLocal(baseName, () => downloadFile(id, baseName), null);
       let out = `**Attachment: ${meta(name, generated ? "generated image" : "image")}**`;
@@ -744,7 +744,7 @@ async function exportChatGPT(opts = {}) {
     // code with the same author's chatgpt-exporter.
     const LAYOUT_TAG = /^(?:box|row|col|column|stack|grid|card|icon|divider|badge|list|list-item|title|text|checkbox|button|spacer|FileCite|Cite)$/;
     const stripLayout = (input) => {
-      if (!/<(?:box|row|list|badge|title|checkbox|FileCite|Cite)\b|\{@body|\{#each/.test(input)) return input;
+      if (!/<(?:box|row|list|badge|title|checkbox|FileCite|Cite)\b|<[A-Z][A-Za-z]*\b[^>]*\/>|\{@body|\{#each/.test(input)) return input;
       const out = [];
       let inFence = false, depth = 0, skipEach = 0;
       for (const line of input.split("\n")) {
@@ -758,7 +758,8 @@ async function exportChatGPT(opts = {}) {
         const wasInside = depth > 0;
         let hadTag = false;
         let s = line.replace(/<\/?([A-Za-z][\w-]*)\b(?:[^>"']|"[^"]*"|'[^']*')*?\/?>/g, (tag, name) => {
-          if (!LAYOUT_TAG.test(name)) return tag;
+          // Also drop any self-closing component tag (<AsyncImage …/> etc.).
+          if (!LAYOUT_TAG.test(name) && !(/^[A-Z]/.test(name) && tag.endsWith("/>"))) return tag;
           hadTag = true;
           if (tag.startsWith("</")) { depth = Math.max(0, depth - 1); return ""; }
           if (tag.endsWith("/>")) return "";
@@ -766,7 +767,10 @@ async function exportChatGPT(opts = {}) {
           return name === "list-item" ? "- " : "";
         });
         if (!hadTag && !wasInside) { out.push(line); continue; }
-        s = s.replace(/\{[^{}]*\}/g, "").trim();
+        // Text built from widget variables ("{checked.length} of {tests.length}")
+        // means nothing without the widget; drop the whole line.
+        if (/\{[^{}]*\}/.test(s)) continue;
+        s = s.trim();
         if (s) out.push(s);
         else if (out.length && out[out.length - 1] !== "") out.push("");
       }
@@ -776,7 +780,47 @@ async function exportChatGPT(opts = {}) {
       String(s)
         .replace(/[ \t]?\uE200[^\uE201]*\uE201/g, "")
         .replace(/[\uE203\uE204]/g, "")
-    ).trim();
+    ).replace(/\n{3,}/g, "\n\n").trim();
+
+    // Files ChatGPT creates with its code tool are linked as
+    // sandbox:/mnt/data/<name>. The web app fetches them through
+    // /backend-api/conversation/<id>/interpreter/download?message_id=…&sandbox_path=…,
+    // which (like files/download) returns JSON with a temporary download_url.
+    // UNVERIFIED against a live session. Sandbox files also expire some time
+    // after the chat, so older chats fall back to a "file not saved" label.
+    let turnIds = []; // message ids since the last user message, newest last
+    const sandboxCache = new Map();
+    const downloadSandbox = async (path) => {
+      // Try the newest message of this turn first; report the most useful
+      // reason (e.g. "file_expired") rather than a later 404.
+      const errs = [];
+      for (const mid of [...turnIds].reverse()) {
+        let info;
+        try {
+          const r = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}/interpreter/download?message_id=${encodeURIComponent(mid)}&sandbox_path=${encodeURIComponent(path)}`, authInit);
+          if (!r.ok) { errs.push(`HTTP ${r.status}`); continue; }
+          info = await r.json();
+        } catch (e) { errs.push(e.message || String(e)); continue; }
+        if (!info?.download_url) { errs.push(info?.error_code || info?.error_message || info?.status || "no download_url"); continue; }
+        const url = new URL(info.download_url, location.origin);
+        return await fetchBytes(url.href, url.origin === location.origin ? authInit : { credentials: "omit" }, path.split("/").pop());
+      }
+      throw new Error(errs.find((e) => !/^HTTP 404$/.test(e)) || errs[0] || "not found");
+    };
+    const resolveSandboxLinks = async (text) => {
+      const found = [...text.matchAll(/\[([^\]]*)\]\(sandbox:(\/mnt\/data\/[^)\s]+)\)/g)];
+      for (const [whole, label, rawPath] of found) {
+        let path;
+        try { path = decodeURIComponent(rawPath); } catch { path = rawPath; }
+        if (!sandboxCache.has(path)) {
+          const base = path.split("/").pop() || "file";
+          sandboxCache.set(path, await fetchLocal(base, () => downloadSandbox(path), null));
+        }
+        const { link, name } = sandboxCache.get(path);
+        text = text.replace(whole, link ? `[${label}](${link})` : `${label} *(file not saved: ${name})*`);
+      }
+      return text;
+    };
 
     const title = (data?.title || "").trim() || "ChatGPT conversation";
     let body = [
@@ -807,6 +851,8 @@ async function exportChatGPT(opts = {}) {
       const contentType = msg.content?.content_type;
       const parts = Array.isArray(msg.content?.parts) ? msg.content.parts : [];
       const created = msg.create_time ? new Date(msg.create_time * 1000) : null;
+      if (role === "user") turnIds = [];
+      else turnIds.push(msg.id || node.id);
 
       if (role === "tool") {
         for (const p of parts) {
@@ -837,9 +883,9 @@ async function exportChatGPT(opts = {}) {
         pendingTime = null;
       }
       for (const p of parts) {
-        if (typeof p === "string") { const t = cleanText(p); if (t) out.push(t); }
+        if (typeof p === "string") { const t = await resolveSandboxLinks(cleanText(p)); if (t) out.push(t); }
         else if (p?.content_type === "image_asset_pointer") { const img = await renderImage(p, role === "assistant"); if (img) out.push(img); }
-        else if (typeof p?.text === "string") { const t = cleanText(p.text); if (t) out.push(t); }
+        else if (typeof p?.text === "string") { const t = await resolveSandboxLinks(cleanText(p.text)); if (t) out.push(t); }
       }
       const text = out.filter(Boolean).join("\n\n").trim();
       if (!text) continue;
