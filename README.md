@@ -136,7 +136,7 @@ Toolbar or sidebar — pick one in the extension's options page (`about:addons` 
 - 🟢 Requires the account you're currently signed into on each platform
 - 🟢 Relies on each service's internal, undocumented API (Claude, ChatGPT, DeepSeek) or rendered page structure (Gemini) — a response-shape or UI change would require an update
 - 🟢 **Claude**: other tool calls (web search, bash, file view/edit) and internal thinking blocks aren't exported by design
-- **Gemini**: images and attachments aren't exported yet
+- **Gemini**: images and attachments aren't exported yet, and a few text glitches remain in your own messages (see Roadmap)
 - **ChatGPT**: verified live (Oct 2026) for uploaded and generated images and for files its code tool creates (PDF, PNG, ZIP). Those created files expire some time after the chat, and some can't be downloaded at all — a generated `.js` file failed in ChatGPT's own preview and Download button too. Either way the `.md` gets a "file not saved" label instead of a dead link
 - **Claude**: uploaded images export as Claude's downscaled WebP preview; whether the original file can be downloaded is unconfirmed
 - **DeepSeek**: verified live (Oct 2026). Uploaded images are saved at DeepSeek's preview size. Uploaded documents (PDF, DOCX…) aren't downloaded yet — DeepSeek's file server rejects the request without a file-type parameter whose value for documents is still unknown — so they stay as links (which expire) with name and size. DeepSeek can't generate files, so this only affects copies of your own uploads
@@ -156,6 +156,7 @@ Toolbar or sidebar — pick one in the extension's options page (`about:addons` 
 - Perplexity support — attempted for v2.0.0 (it has its own native "Export as Markdown" feature, reachable via its `···` menu) but pulled before release; the DOM interaction was tricky enough to need more testing than this cycle had room for
 - Meta AI, Grok, and Copilot — rounding out support for all of the "Big 8" AI chat platforms
 - Gemini attachments — likely by moving Gemini off page-scraping onto its internal data feed, as AI-Exporter does
+- Gemini text fixes (found in live testing, present since v2.0.0): your messages pick up Gemini's hidden "You said" label plus a truncated preview before the full text; line breaks in your messages are lost; attachment-chip text (e.g. "PDF+ 2") leaks into replies. Either fixed against Gemini's current page structure, or by the data-feed rewrite above
 - DeepSeek uploaded documents and full-size images — needs the `ty=` value DeepSeek's own viewer uses (one network capture)
 
 ## Contributing
