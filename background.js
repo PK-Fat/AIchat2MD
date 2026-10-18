@@ -448,11 +448,16 @@ async function exportClaude(opts = {}) {
       usedNames.add(name.toLowerCase());
       return name;
     };
-    const toBase64 = (bytes) => {
-      let bin = "";
-      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      return btoa(bin);
-    };
+    const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+      // FileReader, not typed-array tricks: in Firefox the fetched data
+      // belongs to the page, and touching its ArrayBuffer/Uint8Array from
+      // injected extension code throws "Permission denied to access
+      // property 'constructor'".
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result).slice(String(fr.result).indexOf(",") + 1));
+      fr.onerror = () => reject(fr.error || new Error("couldn't read file"));
+      fr.readAsDataURL(blob);
+    });
     const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
     // Returns the link to use: local path if downloaded, else the remote URL.
     const fetchLocal = async (url, name) => {
@@ -460,9 +465,11 @@ async function exportClaude(opts = {}) {
       try {
         const r = await fetch(url, { credentials: "include" });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const bytes = new Uint8Array(await r.arrayBuffer());
+        const blob = await r.blob();
+        if (!blob.size) throw new Error("empty file");
+        const base64 = await blobToBase64(blob);
         const finalName = uniqueName(name);
-        files.push({ name: finalName, base64: toBase64(bytes) });
+        files.push({ name: finalName, base64 });
         return localLink(finalName);
       } catch (e) {
         failed.push(`${name} (${e.message || e})`);
@@ -601,11 +608,16 @@ async function exportChatGPT(opts = {}) {
       usedNames.add(name.toLowerCase());
       return name;
     };
-    const toBase64 = (bytes) => {
-      let bin = "";
-      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      return btoa(bin);
-    };
+    const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+      // FileReader, not typed-array tricks: in Firefox the fetched data
+      // belongs to the page, and touching its ArrayBuffer/Uint8Array from
+      // injected extension code throws "Permission denied to access
+      // property 'constructor'".
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result).slice(String(fr.result).indexOf(",") + 1));
+      fr.onerror = () => reject(fr.error || new Error("couldn't read file"));
+      fr.readAsDataURL(blob);
+    });
     const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
     const escAlt = (s) => String(s).replace(/[[\]]/g, "\\$&");
     const formatBytes = (n) => {
@@ -622,20 +634,20 @@ async function exportChatGPT(opts = {}) {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
       if (/json|html/.test(type) && !/\.(json|html?)$/i.test(name || "")) throw new Error(`got ${type} instead of the file`);
-      const bytes = new Uint8Array(await r.arrayBuffer());
-      if (!bytes.length) throw new Error("empty file");
-      return { bytes, type };
+      const blob = await r.blob();
+      if (!blob.size) throw new Error("empty file");
+      return { blob, type };
     };
-    // getBytes() -> { bytes, type }. Returns { link, name }: link is the
+    // getBytes() -> { blob, type }. Returns { link, name }: link is the
     // local _attachments/ path when saved, else `remote` (may be null).
     const fetchLocal = async (rawName, getBytes, remote) => {
       if (!opts.downloadAttachments) return { link: remote || null, name: rawName };
       try {
-        const { bytes, type } = await getBytes();
+        const { blob, type } = await getBytes();
         let name = rawName;
         if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
         name = uniqueName(name);
-        files.push({ name, base64: toBase64(bytes) });
+        files.push({ name, base64: await blobToBase64(blob) });
         return { link: localLink(name), name };
       } catch (e) {
         failed.push(`${rawName} (${e.message || e})`);
@@ -1039,11 +1051,16 @@ async function exportDeepSeek(opts = {}) {
         usedNames.add(name.toLowerCase());
         return name;
       };
-      const toBase64 = (bytes) => {
-        let bin = "";
-        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-        return btoa(bin);
-      };
+      const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+        // FileReader, not typed-array tricks: in Firefox the fetched data
+        // belongs to the page, and touching its ArrayBuffer/Uint8Array from
+        // injected extension code throws "Permission denied to access
+        // property 'constructor'".
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result).slice(String(fr.result).indexOf(",") + 1));
+        fr.onerror = () => reject(fr.error || new Error("couldn't read file"));
+        fr.readAsDataURL(blob);
+      });
       const localLink = (name) => "_attachments/" + encodeURIComponent(name).replace(/\(/g, "%28").replace(/\)/g, "%29");
       const escAlt = (s) => String(s).replace(/[[\]]/g, "\\$&");
       const formatBytes = (n) => {
@@ -1060,20 +1077,20 @@ async function exportDeepSeek(opts = {}) {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const type = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
         if (/json|html/.test(type) && !/\.(json|html?)$/i.test(name || "")) throw new Error(`got ${type} instead of the file`);
-        const bytes = new Uint8Array(await r.arrayBuffer());
-        if (!bytes.length) throw new Error("empty file");
-        return { bytes, type };
+        const blob = await r.blob();
+        if (!blob.size) throw new Error("empty file");
+        return { blob, type };
       };
-      // getBytes() -> { bytes, type }. Returns { link, name }: link is the
+      // getBytes() -> { blob, type }. Returns { link, name }: link is the
       // local _attachments/ path when saved, else `remote` (may be null).
       const fetchLocal = async (rawName, getBytes, remote) => {
         if (!opts.downloadAttachments) return { link: remote || null, name: rawName };
         try {
-          const { bytes, type } = await getBytes();
+          const { blob, type } = await getBytes();
           let name = rawName;
           if (!/\.[a-z0-9]{2,5}$/i.test(name) && MIME_EXT[type]) name += MIME_EXT[type];
           name = uniqueName(name);
-          files.push({ name, base64: toBase64(bytes) });
+          files.push({ name, base64: await blobToBase64(blob) });
           return { link: localLink(name), name };
         } catch (e) {
           failed.push(`${rawName} (${e.message || e})`);
