@@ -703,7 +703,12 @@ async function exportChatGPT(opts = {}) {
         // Got a real link: its result (bytes or error) is the answer.
         const url = new URL(info.download_url, location.origin);
         const same = url.origin === location.origin;
-        return await fetchBytes(url.href, same ? authInit : { credentials: "omit" }, name);
+        try {
+          return await fetchBytes(url.href, same ? authInit : { credentials: "omit" }, name);
+        } catch (e) {
+          console.warn("[AIchat2MD] ChatGPT file download failed:", name, url.href, e);
+          throw new Error(`file download from ${url.hostname}: ${e.message || e}`);
+        }
       }
       throw new Error(lastErr);
     };
@@ -798,14 +803,19 @@ async function exportChatGPT(opts = {}) {
         let info;
         try {
           const r = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}/interpreter/download?message_id=${encodeURIComponent(mid)}&sandbox_path=${encodeURIComponent(path)}`, authInit);
-          if (!r.ok) { errs.push(`HTTP ${r.status}`); continue; }
+          if (!r.ok) { errs.push(`link request: HTTP ${r.status}`); continue; }
           info = await r.json();
-        } catch (e) { errs.push(e.message || String(e)); continue; }
-        if (!info?.download_url) { errs.push(info?.error_code || info?.error_message || info?.status || "no download_url"); continue; }
+        } catch (e) { errs.push(`link request: ${e.message || e}`); continue; }
+        if (!info?.download_url) { errs.push(`link request: ${info?.error_code || info?.error_message || info?.status || "no download_url"}`); continue; }
         const url = new URL(info.download_url, location.origin);
-        return await fetchBytes(url.href, url.origin === location.origin ? authInit : { credentials: "omit" }, path.split("/").pop());
+        try {
+          return await fetchBytes(url.href, url.origin === location.origin ? authInit : { credentials: "omit" }, path.split("/").pop());
+        } catch (e) {
+          console.warn("[AIchat2MD] ChatGPT file download failed:", path, url.href, e);
+          throw new Error(`file download from ${url.hostname}: ${e.message || e}`);
+        }
       }
-      throw new Error(errs.find((e) => !/^HTTP 404$/.test(e)) || errs[0] || "not found");
+      throw new Error(errs.find((e) => !/HTTP 404$/.test(e)) || errs[0] || "not found");
     };
     const resolveSandboxLinks = async (text) => {
       const found = [...text.matchAll(/\[([^\]]*)\]\(sandbox:(\/mnt\/data\/[^)\s]+)\)/g)];
