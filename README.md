@@ -139,7 +139,7 @@ Toolbar or sidebar — pick one in the extension's options page (`about:addons` 
 - **Gemini**: images and attachments aren't exported yet
 - **ChatGPT**: verified live (Oct 2026) for uploaded and generated images and for files its code tool creates (PDF, PNG, ZIP). Those created files expire some time after the chat, and some can't be downloaded at all — a generated `.js` file failed in ChatGPT's own preview and Download button too. Either way the `.md` gets a "file not saved" label instead of a dead link
 - **Claude**: uploaded images export as Claude's downscaled WebP preview; whether the original file can be downloaded is unconfirmed
-- **DeepSeek attachments**: built from other open-source exporters' documented approaches but not yet verified against a live session; images use the preview size the web app shows
+- **DeepSeek**: verified live (Oct 2026). Uploaded images are saved at DeepSeek's preview size. Uploaded documents (PDF, DOCX…) aren't downloaded yet — DeepSeek's file server rejects the request without a file-type parameter whose value for documents is still unknown — so they stay as links (which expire) with name and size. DeepSeek can't generate files, so this only affects copies of your own uploads
 - **Gemini and DeepSeek's DOM-scraping paths** are inherently more fragile than Claude/ChatGPT's API-based ones — a Google or DeepSeek UI update is more likely to break these than a Claude/OpenAI one is to break theirs
 - All four only export the currently-selected branch of a conversation, not every regenerated alternative
 
@@ -156,6 +156,7 @@ Toolbar or sidebar — pick one in the extension's options page (`about:addons` 
 - Perplexity support — attempted for v2.0.0 (it has its own native "Export as Markdown" feature, reachable via its `···` menu) but pulled before release; the DOM interaction was tricky enough to need more testing than this cycle had room for
 - Meta AI, Grok, and Copilot — rounding out support for all of the "Big 8" AI chat platforms
 - Gemini attachments — likely by moving Gemini off page-scraping onto its internal data feed, as AI-Exporter does
+- DeepSeek uploaded documents and full-size images — needs the `ty=` value DeepSeek's own viewer uses (one network capture)
 
 ## Contributing
 
